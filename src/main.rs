@@ -162,7 +162,13 @@ fn count_from_compressed_data(compressed_data: Vec<u8>, mut local_counter: HashM
 
 async fn process_file(input: &PathBuf, token_counter: &Arc<DashMap<u64, usize>>) -> Result<(), Error> {
     // Count number of tokens in each context in each input 
-    let reader = read_pathbuf_to_mem(input).unwrap();
+
+
+    let reader = if is_s3(input) {
+        get_reader_from_s3(input, Some(5)).await.unwrap()
+    } else {
+        BufReader::new(read_local_file_into_memory(&input).unwrap())
+    };
     let mut tar = Archive::new(reader);
     let mut local_token_counter : HashMap<u64, usize> = HashMap::new(); 
 
