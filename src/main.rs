@@ -1,3 +1,7 @@
+use std::ffi::OsStr;
+use std::hash::Hasher;
+use std::hash::Hash;
+use std::hash::DefaultHasher;
 use std::io::Read;
 use std::time::Instant;
 use anyhow::{anyhow, bail, Result, Error};
@@ -138,6 +142,15 @@ fn read_local_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, E
 }
 
 
+fn hash_str(text: &OsStr, seed: usize) -> u64 {
+    // Hashes a vector of type T into a u64 hash value
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+
 
 /*==============================================================
 =                             Meat                             =
@@ -146,12 +159,12 @@ fn read_local_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, E
 
 
 
-fn count_from_compressed_data(compressed_data: Vec<u8>, mut local_counter: HashMap<i32, usize>) -> Result<HashMap<i32, usize>, Error> {
+fn count_from_compressed_data(compressed_data: Vec<u8>, mut local_counter: HashMap<u64, usize>) -> Result<HashMap<u64, usize>, Error> {
     let mut decoder = MultiGzDecoder::new(&compressed_data[..]);
     let mut decompressed_data = Vec::new();
     decoder.read_to_end(&mut decompressed_data).unwrap();
 
-    let numbers: Vec<i32> = from_slice(&decompressed_data).unwrap();
+    let numbers: Vec<u64> = from_slice(&decompressed_data).unwrap();
     for number in numbers {
         *local_counter.entry(number).or_insert(0) += 1;
     }
@@ -160,7 +173,7 @@ fn count_from_compressed_data(compressed_data: Vec<u8>, mut local_counter: HashM
 
 
 
-async fn process_file(input: &PathBuf, token_counter: &Arc<DashMap<i32, usize>>) -> Result<(), Error> {
+async fn process_file(input: &PathBuf, global_counter: &Arc<DashMap<u64, usize>>) -> Result<(), Error> {
     // Count number of tokens in each context in each input 
 
 
@@ -170,21 +183,24 @@ async fn process_file(input: &PathBuf, token_counter: &Arc<DashMap<i32, usize>>)
         BufReader::new(read_local_file_into_memory(&input).unwrap())
     };
     let mut tar = Archive::new(reader);
-    let mut local_token_counter : HashMap<i32, usize> = HashMap::new(); 
+    let mut local_counter : HashMap<u64, usize> = HashMap::new(); 
 
 
     for entry in tar.entries()? {
         // iterate over entries and increment local hashmap
-        let mut entry = entry?;
-        let mut compressed_data : Vec<u8> = Vec::new();
-        entry.read_to_end(&mut compressed_data).unwrap();
-        local_token_counter = count_from_compressed_data(compressed_data, local_token_counter).unwrap()
+        let entry = entry?;
+        let path = entry.path().unwrap();
+        let path = path.as_os_str();
+
+        let path_hash = hash_str(path, 1234);
+
+        *local_counter.entry(path_hash).or_insert(0) += 1;
     }
 
     // plug these hash values into the global counter
-    for (key, value) in local_token_counter.iter() {
-        token_counter.entry(*key).or_insert(0);
-        token_counter.alter(&key, |_, cur| {
+    for (key, value) in local_counter.iter() {
+        global_counter.entry(*key).or_insert(0);
+        global_counter.alter(&key, |_, cur| {
             cur + value
         });
     }
@@ -249,7 +265,7 @@ fn main() -> Result<()> {
 
     // Step 3: finalize the dashmap into something we can save
     //token_counter.into_inner();
-    let token_counter : HashMap<i32, usize> = <DashMap<i32, usize> as Clone>::clone(&token_counter).into_iter().collect();
+    let token_counter : HashMap<u64, usize> = <DashMap<u64, usize> as Clone>::clone(&token_counter).into_iter().collect();
     let json_data = json!(token_counter);
 
 
