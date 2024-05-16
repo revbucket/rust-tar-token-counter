@@ -55,6 +55,11 @@ struct Args {
     /// Number of threads to use 
     #[arg(long, default_value_t=0)]
     threads: usize,
+
+
+    /// Extension of file 
+    #[arg(required=true, long)]
+    ext: String,
 }
 
 
@@ -224,7 +229,7 @@ fn main() -> Result<()> {
     } else {
         args.threads
     };    
-    let input_files =  expand_dirs(args.input, Some("")).unwrap() ;
+    let input_files =  expand_dirs(args.input, Some(&args.ext)).unwrap() ;
 
 
 
