@@ -26,7 +26,7 @@ use dashmap::DashMap;
 use indicatif::{ProgressBar,ProgressStyle};
 use zstd::stream::read::Decoder as ZstdDecoder;
 
-
+use rayon::prelude::*;
 
 use flate2::read::MultiGzDecoder;
 
@@ -265,10 +265,17 @@ fn main() -> Result<()> {
 
     // Step 3: finalize the dashmap into something we can save
     //token_counter.into_inner();
-    let token_counter : HashMap<u64, usize> = <DashMap<u64, usize> as Clone>::clone(&token_counter).into_iter().collect();
+    println!("DASHMAP HAS LEN {:?}", token_counter.len());
+    let token_counter : HashMap<u64, usize> = (<DashMap<u64, usize> as Clone>::clone(&token_counter))
+        .into_iter()
+        .par_bridge()
+        .filter(|entry| entry.1 > 1)
+        .map(|entry| (entry.0, entry.1))
+        .collect();
+    println!("TOKEN COUNTER HAS OUTPUT LEN {:?}", token_counter.len());
+
     let json_data = json!(token_counter);
-
-
+    println!("DONE WITH JSONING, NOW UPLOADING");
     if is_s3(&args.output) {
         let json_bytes: Vec<u8> = serde_json::to_vec(&json_data).unwrap();
         let cursor = Cursor::new(json_bytes);
