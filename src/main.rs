@@ -188,7 +188,8 @@ fn load_tiktoken_tokenizer() -> Result<CoreBPE> {
 
 
 
-async fn process_file(input: &PathBuf, global_toklengths: &Arc<Mutex<Vec<usize>>>, global_bytelengths: &Arc<Mutex<Vec<usize>>>) -> Result<(), Error> {
+async fn process_file(input: &PathBuf, global_toklengths: &Arc<Mutex<Vec<usize>>>, global_bytelengths: &Arc<Mutex<Vec<usize>>>,
+                      pbar: &Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
     // Count document lengths (in characters, and tokens) and return them
 
     let reader = if is_s3(input) {
@@ -214,6 +215,8 @@ async fn process_file(input: &PathBuf, global_toklengths: &Arc<Mutex<Vec<usize>>
     global_bytelengths.lock().unwrap().extend(local_bytelengths);
     global_toklengths.lock().unwrap().extend(local_toklengths);
 
+
+    pbar.lock().unwrap().inc(1);
     Ok(())
 
 }
@@ -265,8 +268,8 @@ fn main() -> Result<()> {
                     &input,
                     &global_toklengths,
                     &global_bytelengths,
+                    &pbar,
                     );              
-                pbar.lock().unwrap().inc(1);
                 subresult}
                 );            
             match result {            
