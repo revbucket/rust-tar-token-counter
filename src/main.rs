@@ -1,30 +1,37 @@
-use std::io::Read;
+use serde_json::Value;
+use std::io::BufRead;
 use std::time::Instant;
 use anyhow::{anyhow, bail, Result, Error};
 use clap::Parser;
 use std::path::{PathBuf};
-use std::io::{BufReader, Cursor, Write};
+use std::io::{BufReader, Cursor, Read, Write};
 use std::fs::{File};
 
 use std::thread::available_parallelism;
-use std::collections::{HashMap};
+
 use std::sync::{Arc, Mutex};
 
 
 use threadpool::ThreadPool;
 use crate::s3::{is_s3, expand_s3_dir, get_reader_from_s3, write_cursor_to_s3};
-use serde_json::{json};
-use tar::{Archive};
+
+
 use serde_json;
-use serde_json::from_slice;
+
 use glob::glob;
-use dashmap::DashMap;
+
 use indicatif::{ProgressBar,ProgressStyle};
 use zstd::stream::read::Decoder as ZstdDecoder;
+
+use base64::{engine::general_purpose, Engine as _};
+use tiktoken_rs::CoreBPE;
+use rustc_hash::FxHashMap;
 
 
 
 use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 
 pub mod s3;
@@ -49,7 +56,6 @@ struct Args {
     #[arg(long, default_value_t=0)]
     threads: usize,
 }
-
 
 
 
@@ -138,56 +144,70 @@ fn read_local_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, E
 }
 
 
+fn compress_gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
 
 /*==============================================================
 =                             Meat                             =
 ==============================================================*/
 
+fn load_tiktoken_tokenizer() -> Result<CoreBPE> {
+    // Loats the tiktoken tokenizer. Some magic strings here, but don't worry about it ;)
+    let pattern = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+    let tiktoken_data = include_str!("../EleutherAI_gpt-neox-20b.tiktoken");
 
+    let mut encoder = FxHashMap::default();
 
-
-fn count_from_compressed_data(compressed_data: Vec<u8>, mut local_counter: HashMap<i32, usize>) -> Result<HashMap<i32, usize>, Error> {
-    let mut decoder = MultiGzDecoder::new(&compressed_data[..]);
-    let mut decompressed_data = Vec::new();
-    decoder.read_to_end(&mut decompressed_data).unwrap();
-
-    let numbers: Vec<i32> = from_slice(&decompressed_data).unwrap();
-    for number in numbers {
-        *local_counter.entry(number).or_insert(0) += 1;
+    for line in tiktoken_data.lines() {
+        let mut parts = line.split(' ');
+        let raw = parts.next().unwrap();
+        let token = &general_purpose::STANDARD.decode(raw)?;
+        let rank: usize = parts.next().unwrap().parse().unwrap();
+        encoder.insert(token.clone(), rank);        
     }
-    Ok(local_counter)
+    let special_tokens = FxHashMap::default();
+    let bpe = CoreBPE::new(
+        encoder, 
+        special_tokens,
+        pattern,
+        )?;
+
+    Ok(bpe)
 }
 
 
 
-async fn process_file(input: &PathBuf, token_counter: &Arc<DashMap<i32, usize>>) -> Result<(), Error> {
-    // Count number of tokens in each context in each input 
 
+
+async fn process_file(input: &PathBuf, global_toklengths: &Arc<Mutex<Vec<usize>>>, global_bytelengths: &Arc<Mutex<Vec<usize>>>) -> Result<(), Error> {
+    // Count document lengths (in characters, and tokens) and return them
 
     let reader = if is_s3(input) {
         get_reader_from_s3(input, Some(5)).await.unwrap()
     } else {
         BufReader::new(read_local_file_into_memory(&input).unwrap())
     };
-    let mut tar = Archive::new(reader);
-    let mut local_token_counter : HashMap<i32, usize> = HashMap::new(); 
+    let tokenizer = load_tiktoken_tokenizer()?;
+
+    let mut local_bytelengths: Vec<usize> = Vec::new();
+    let mut local_toklengths: Vec<usize> = Vec::new();
 
 
-    for entry in tar.entries()? {
-        // iterate over entries and increment local hashmap
-        let mut entry = entry?;
-        let mut compressed_data : Vec<u8> = Vec::new();
-        entry.read_to_end(&mut compressed_data).unwrap();
-        local_token_counter = count_from_compressed_data(compressed_data, local_token_counter).unwrap()
+    for line in reader.lines() {
+        let line = line?; 
+        let json: Value = serde_json::from_str(&line)?;
+        let text = json["text"].as_str().unwrap();         
+        local_bytelengths.push(text.len());
+        local_toklengths.push(tokenizer.encode_with_special_tokens(text).len());
     }
 
-    // plug these hash values into the global counter
-    for (key, value) in local_token_counter.iter() {
-        token_counter.entry(*key).or_insert(0);
-        token_counter.alter(&key, |_, cur| {
-            cur + value
-        });
-    }
+
+    global_bytelengths.lock().unwrap().extend(local_bytelengths);
+    global_toklengths.lock().unwrap().extend(local_toklengths);
 
     Ok(())
 
@@ -204,7 +224,7 @@ fn main() -> Result<()> {
     } else {
         args.threads
     };    
-    let input_files =  expand_dirs(args.input, Some(".tar")).unwrap() ;
+    let input_files =  expand_dirs(args.input, Some("")).unwrap() ;
 
 
 
@@ -215,14 +235,21 @@ fn main() -> Result<()> {
             ).unwrap()
         );
     let pbar = Arc::new(Mutex::new(pbar));
-    let token_counter = Arc::new(DashMap::new());
+
+
 
 
     // Step 2: Iterate over all files and process
+    let global_toklengths: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let global_bytelengths: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+
     let threadpool = ThreadPool::new(threads);
+
+
     for input in input_files {    
         let pbar = pbar.clone();
-        let token_counter = Arc::clone(&token_counter);
+        let global_toklengths = Arc::clone(&global_toklengths);
+        let global_bytelengths = Arc::clone(&global_bytelengths);
         threadpool.execute(move || {        
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -231,7 +258,8 @@ fn main() -> Result<()> {
             let result = rt.block_on({
                 let subresult = process_file(
                     &input,
-                    &token_counter,
+                    &global_toklengths,
+                    &global_bytelengths,
                     );              
                 pbar.lock().unwrap().inc(1);
                 subresult}
@@ -249,13 +277,16 @@ fn main() -> Result<()> {
 
     // Step 3: finalize the dashmap into something we can save
     //token_counter.into_inner();
-    let token_counter : HashMap<i32, usize> = <DashMap<i32, usize> as Clone>::clone(&token_counter).into_iter().collect();
-    let json_data = json!(token_counter);
 
+    let json_data = serde_json::json!({
+        "bytelengths": global_bytelengths.lock().unwrap().clone(),
+        "toklengths": global_toklengths.lock().unwrap().clone(),
+    });
+    let json_bytes: Vec<u8> = serde_json::to_vec(&json_data).unwrap();
+    let gzip_bytes: Vec<u8> = compress_gzip(&json_bytes);    
 
     if is_s3(&args.output) {
-        let json_bytes: Vec<u8> = serde_json::to_vec(&json_data).unwrap();
-        let cursor = Cursor::new(json_bytes);
+        let cursor = Cursor::new(gzip_bytes);
         let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -263,7 +294,7 @@ fn main() -> Result<()> {
         rt.block_on(write_cursor_to_s3(&args.output, cursor)).unwrap();        
     } else {
         let mut file = File::create(args.output).unwrap();
-        file.write_all(json_data.to_string().as_bytes()).unwrap();
+        file.write_all(gzip_bytes.as_slice()).unwrap();
     }
 
     println!("Ran in {:?} (s)", start_time.elapsed().as_secs());
