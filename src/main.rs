@@ -150,6 +150,15 @@ fn hash_str(text: &OsStr, seed: usize) -> u64 {
     hasher.finish()
 }
 
+fn hash_vec<T>(vec: &Vec<T>, seed: usize) -> u64 where T: Hash {
+    // Hashes a vector of type T into a u64 hash value
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    vec.hash(&mut hasher);
+    hasher.finish()
+}
+
+
 
 
 /*==============================================================
@@ -188,13 +197,12 @@ async fn process_file(input: &PathBuf, global_counter: &Arc<DashMap<u64, usize>>
 
     for entry in tar.entries()? {
         // iterate over entries and increment local hashmap
-        let entry = entry?;
-        let path = entry.path().unwrap();
-        let path = path.as_os_str();
+        let mut entry = entry?;
+        let mut data : Vec<u8> = Vec::new();
+        entry.read_to_end(&mut data).unwrap();   
+        let data_hash = hash_vec::<u8>(&data, 1234 as usize);
 
-        let path_hash = hash_str(path, 1234);
-
-        *local_counter.entry(path_hash).or_insert(0) += 1;
+        *local_counter.entry(data_hash).or_insert(0) += 1;
     }
 
     // plug these hash values into the global counter
